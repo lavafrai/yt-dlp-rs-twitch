@@ -5,6 +5,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Deserializer};
 use tokio::task::JoinHandle;
 
 use crate::error::Result;
@@ -136,4 +137,15 @@ pub fn current_timestamp() -> i64 {
 pub fn is_expired(cached_at: i64, ttl: u64) -> bool {
     let now = current_timestamp();
     (now - cached_at) > ttl as i64
+}
+
+/// Null handling in serde
+pub fn null_to_default<'de, D, T>(d: D) -> ::std::result::Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    let opt = Option::deserialize(d)?;
+    let val = opt.unwrap_or_else(T::default);
+    Ok(val)
 }
