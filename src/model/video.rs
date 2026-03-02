@@ -212,7 +212,7 @@ impl Video {
     pub fn formats_available_at(&self) -> Option<i64> {
         self.formats
             .iter()
-            .filter(|f| !matches!(f.format_type(), FormatType::Storyboard | FormatType::Manifest))
+            .filter(|f| !matches!(f.format_type(), FormatType::Storyboard | FormatType::Manifest { .. }))
             .filter_map(|f| f.available_at)
             .min()
     }

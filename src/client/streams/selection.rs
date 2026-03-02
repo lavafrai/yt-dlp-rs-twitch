@@ -244,7 +244,17 @@ impl VideoSelection for Video {
         let a_vbr = a.rates_info.video_rate.map(|vr| *vr).unwrap_or(0.0);
         let b_vbr = b.rates_info.video_rate.map(|vr| *vr).unwrap_or(0.0);
 
-        OrderedFloat(a_vbr).cmp(&OrderedFloat(b_vbr))
+        let cmp_vbr = OrderedFloat(a_vbr).cmp(&OrderedFloat(b_vbr));
+        if cmp_vbr != Ordering::Equal {
+            return cmp_vbr;
+        }
+
+        // Prefer non-manifest formats over manifest formats
+        match (a.is_manifest(), b.is_manifest()) {
+            (true, true) | (false, false) => Ordering::Equal,
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+        }
     }
 
     /// Compares two audio formats.

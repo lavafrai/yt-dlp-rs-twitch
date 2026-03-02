@@ -26,9 +26,21 @@ pub trait BaseMetadata {
     fn extract_basic_metadata(video: &Video) -> Vec<(String, String)> {
         let mut metadata = vec![("title".to_string(), video.title.clone())];
 
-        Self::add_metadata_if_some(&mut metadata, "artist", video.channel.clone());
-        Self::add_metadata_if_some(&mut metadata, "album_artist", video.channel.clone());
-        Self::add_metadata_if_some(&mut metadata, "album", video.channel.clone());
+        Self::add_metadata_if_some(
+            &mut metadata,
+            "artist",
+            video.uploader.clone().or_else(|| video.channel.clone()),
+        );
+        Self::add_metadata_if_some(
+            &mut metadata,
+            "album_artist",
+            video.uploader.clone().or_else(|| video.channel.clone()),
+        );
+        Self::add_metadata_if_some(
+            &mut metadata,
+            "album",
+            video.uploader.clone().or_else(|| video.channel.clone()),
+        );
 
         // Add tags as genre
         if !video.tags.is_empty() {
