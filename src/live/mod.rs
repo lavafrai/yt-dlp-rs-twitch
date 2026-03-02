@@ -56,6 +56,66 @@ impl fmt::Display for RecordingResult {
     }
 }
 
+/// A single progress snapshot delivered to the [`LiveRecordingBuilder::with_progress`] callback.
+#[derive(Debug, Clone)]
+pub struct LiveProgress {
+    /// Total bytes written to the output file so far.
+    pub bytes_written: u64,
+    /// Wall-clock time elapsed since recording started.
+    pub elapsed: Duration,
+    /// Current effective bitrate in **bits per second**.
+    pub bitrate_bps: f64,
+    /// Number of HLS segments downloaded
+    /// (always `0` for FFmpeg and yt-dlp engines — they handle segments internally).
+    pub segments: u64,
+}
+
+impl fmt::Display for LiveProgress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "LiveProgress(elapsed={:.1}s, bytes={}, bitrate={:.1}kbps, segments={})",
+            self.elapsed.as_secs_f64(),
+            self.bytes_written,
+            self.bitrate_bps / 1_000.0,
+            self.segments,
+        )
+    }
+}
+
+/// A boxed, cheaply-clonable progress callback.
+///
+/// Wraps `Arc<dyn Fn(LiveProgress) + Send + Sync>` and implements `Debug`.
+/// Created automatically by [`LiveRecordingBuilder::with_progress`].
+#[derive(Clone)]
+pub struct ProgressCallback(Arc<dyn Fn(LiveProgress) + Send + Sync>);
+
+impl ProgressCallback {
+    /// Creates a new `ProgressCallback` from a closure or function.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - Callable that receives a [`LiveProgress`] snapshot on each update.
+    pub fn new<F: Fn(LiveProgress) + Send + Sync + 'static>(f: F) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// Invokes the inner callback with the given progress snapshot.
+    ///
+    /// # Arguments
+    ///
+    /// * `progress` - The progress snapshot to deliver.
+    pub fn call(&self, progress: LiveProgress) {
+        (self.0)(progress);
+    }
+}
+
+impl fmt::Debug for ProgressCallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProgressCallback(<fn>)")
+    }
+}
+
 /// Fluent builder for configuring and starting a live recording.
 ///
 /// Created via [`Downloader::record_live`]. Allows configuring the recording method,
@@ -93,6 +153,8 @@ pub struct LiveRecordingBuilder<'a> {
     cancellation_token: Option<CancellationToken>,
     /// Whether to start recording from the beginning of the available stream buffer.
     live_from_start: bool,
+    /// Optional direct progress callback, called on every progress update.
+    progress_callback: Option<ProgressCallback>,
 }
 
 impl<'a> LiveRecordingBuilder<'a> {
@@ -113,6 +175,7 @@ impl<'a> LiveRecordingBuilder<'a> {
             format: None,
             cancellation_token: None,
             live_from_start: false,
+            progress_callback: None,
         }
     }
 
@@ -177,6 +240,51 @@ impl<'a> LiveRecordingBuilder<'a> {
         self
     }
 
+    /// Registers a progress callback invoked on every progress update.
+    ///
+    /// The callback receives a [`LiveProgress`] snapshot with bytes written,
+    /// elapsed time, bitrate, and segment count. It is called:
+    /// - **Native engine**: every ~50 ms after new HLS segments are downloaded.
+    /// - **FFmpeg / yt-dlp engines**: every time the process emits a stats line
+    ///   to stderr (typically once per second or per segment).
+    ///
+    /// The callback is called from a Tokio task — use `move` closures and `Arc`
+    /// for any shared state.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - Closure or function that receives a [`LiveProgress`] snapshot.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use yt_dlp::Downloader;
+    /// # use yt_dlp::client::deps::Libraries;
+    /// # use std::path::PathBuf;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let libraries = Libraries::new(PathBuf::from("libs/yt-dlp"), PathBuf::from("libs/ffmpeg"));
+    /// # let downloader = Downloader::builder(libraries, "output").build().await?;
+    /// # let video = downloader.fetch_video_infos("https://www.twitch.tv/channel").await?;
+    /// let result = downloader
+    ///     .record_live(&video, "live.ts")
+    ///     .with_progress(|p| {
+    ///         println!("{:.1}s | {:.2} MB | {:.1} kbps",
+    ///             p.elapsed.as_secs_f64(),
+    ///             p.bytes_written as f64 / 1_048_576.0,
+    ///             p.bitrate_bps / 1_000.0,
+    ///         );
+    ///     })
+    ///     .execute()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_progress<F: Fn(LiveProgress) + Send + Sync + 'static>(mut self, f: F) -> Self {
+        self.progress_callback = Some(ProgressCallback::new(f));
+        self
+    }
+
     /// Starts the live recording.
     ///
     /// # Errors
@@ -233,6 +341,7 @@ impl<'a> LiveRecordingBuilder<'a> {
                 &quality,
                 self.downloader.args.clone(),
                 self.max_duration,
+                self.progress_callback.clone(),
                 cancellation_token,
                 self.downloader.event_bus.clone(),
             );
@@ -284,6 +393,7 @@ impl<'a> LiveRecordingBuilder<'a> {
                     &quality,
                     self.max_duration,
                     self.live_from_start,
+                    self.progress_callback.clone(),
                     cancellation_token,
                     client,
                     self.downloader.event_bus.clone(),
@@ -300,6 +410,7 @@ impl<'a> LiveRecordingBuilder<'a> {
                     &quality,
                     self.max_duration,
                     self.live_from_start,
+                    self.progress_callback.clone(),
                     cancellation_token,
                     self.downloader.event_bus.clone(),
                 );
@@ -318,6 +429,7 @@ impl fmt::Debug for LiveRecordingBuilder<'_> {
             .field("method", &self.method)
             .field("max_duration", &self.max_duration)
             .field("live_from_start", &self.live_from_start)
+            .field("has_progress", &self.progress_callback.is_some())
             .field("has_format", &self.format.is_some())
             .field("has_token", &self.cancellation_token.is_some())
             .finish()

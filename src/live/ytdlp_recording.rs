@@ -14,6 +14,66 @@ use crate::error::Result;
 use crate::events::DownloadEvent;
 use crate::events::types::RecordingMethod;
 use crate::executor::Executor;
+use crate::live::{LiveProgress, ProgressCallback};
+
+/// Interval between file-size polls for progress reporting.
+const PROGRESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Periodically polls the output file size and emits progress events.
+///
+/// Runs inside a detached `tokio::spawn` task. Checks the file size every
+/// [`PROGRESS_POLL_INTERVAL`] and reports via the optional callback and the
+/// event bus. Stops when `cancel` is triggered.
+///
+/// This approach is more reliable than parsing yt-dlp output because yt-dlp
+/// may delegate to ffmpeg or other external downloaders internally, bypassing
+/// its own progress hooks.
+async fn poll_file_progress(
+    output_path: PathBuf,
+    video_id: String,
+    start: Instant,
+    progress_callback: Option<ProgressCallback>,
+    event_bus: crate::events::EventBus,
+    cancel: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(PROGRESS_POLL_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = interval.tick() => {
+                let bytes = tokio::fs::metadata(&output_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if bytes == 0 {
+                    continue;
+                }
+                let elapsed = start.elapsed();
+                let bitrate_bps = if elapsed.as_secs_f64() > 0.0 {
+                    (bytes as f64 * 8.0) / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                let progress = LiveProgress {
+                    bytes_written: bytes,
+                    elapsed,
+                    bitrate_bps,
+                    segments: 0,
+                };
+                if let Some(cb) = &progress_callback {
+                    cb.call(progress.clone());
+                }
+                event_bus.emit_if_subscribed(DownloadEvent::LiveRecordingProgress {
+                    video_id: video_id.clone(),
+                    elapsed,
+                    bytes_written: bytes,
+                    segments: 0,
+                    bitrate_bps,
+                });
+            }
+        }
+    }
+}
 
 /// yt-dlp-based live stream recorder.
 ///
@@ -34,6 +94,8 @@ pub struct YtDlpLiveRecorder {
     extra_args: Vec<String>,
     /// Optional maximum recording duration.
     max_duration: Option<Duration>,
+    /// Optional direct progress callback.
+    progress_callback: Option<ProgressCallback>,
     /// Cancellation token for graceful stop.
     cancellation_token: CancellationToken,
     /// The event bus for emitting recording events.
@@ -54,6 +116,7 @@ impl YtDlpLiveRecorder {
     /// * `quality` - Quality label (e.g. "1080p").
     /// * `extra_args` - Additional yt-dlp arguments (cookies, proxy, etc.).
     /// * `max_duration` - Optional maximum recording duration.
+    /// * `progress_callback` - Optional callback invoked on every progress line from stderr.
     /// * `cancellation_token` - Token to cancel recording.
     /// * `event_bus` - Event bus for broadcasting progress.
     #[allow(clippy::too_many_arguments)]
@@ -65,6 +128,7 @@ impl YtDlpLiveRecorder {
         quality: impl Into<String>,
         extra_args: Vec<String>,
         max_duration: Option<Duration>,
+        progress_callback: Option<ProgressCallback>,
         cancellation_token: CancellationToken,
         event_bus: crate::events::EventBus,
     ) -> Self {
@@ -76,6 +140,7 @@ impl YtDlpLiveRecorder {
             quality: quality.into(),
             extra_args,
             max_duration,
+            progress_callback,
             cancellation_token,
             event_bus,
         }
@@ -121,6 +186,11 @@ impl YtDlpLiveRecorder {
 
         // Build yt-dlp args:
         //   --live-from-start --no-part -o <output> [extra_args...] <url>
+        //
+        // We intentionally omit --progress / --progress-template because yt-dlp
+        // may delegate downloading to ffmpeg internally (e.g. Twitch), bypassing
+        // its own progress hooks. Progress is instead tracked by polling the
+        // output file size.
         let mut args: Vec<String> = vec![
             "--live-from-start".to_string(),
             "--no-part".to_string(),
@@ -135,7 +205,23 @@ impl YtDlpLiveRecorder {
         let executor = Executor::new(&self.ytdlp_path, &args, Duration::from_secs(0));
         let mut process = executor.execute_streaming().await?;
 
+        // Spawn a task that polls the output file size for progress reporting.
+        // This is more reliable than parsing yt-dlp output because yt-dlp may
+        // delegate downloading to ffmpeg or other backends internally.
+        let progress_cancel = CancellationToken::new();
+        {
+            let output_path = self.output_path.clone();
+            let video_id = self.video_id.clone();
+            let cb = self.progress_callback.clone();
+            let event_bus = self.event_bus.clone();
+            let cancel = progress_cancel.clone();
+            tokio::spawn(poll_file_progress(
+                output_path, video_id, start, cb, event_bus, cancel,
+            ));
+        }
+
         // Wait for cancellation, max duration, or process exit
+        let mut exit_error: Option<crate::error::Error> = None;
         let stop_reason = tokio::select! {
             _ = self.cancellation_token.cancelled() => {
                 tracing::info!(video_id = self.video_id, "📥 Cancellation requested, stopping yt-dlp");
@@ -161,6 +247,11 @@ impl YtDlpLiveRecorder {
                             exit_code = output.code,
                             "yt-dlp exited with non-zero code"
                         );
+                        exit_error = Some(crate::error::Error::CommandFailed {
+                            command: "yt-dlp".to_string(),
+                            exit_code: output.code,
+                            stderr: output.stderr,
+                        });
                         reason
                     }
                     Err(e) => {
@@ -170,11 +261,15 @@ impl YtDlpLiveRecorder {
                             error = %e,
                             "yt-dlp process error"
                         );
+                        exit_error = Some(e);
                         reason
                     }
                 }
             }
         };
+
+        // Stop the progress polling task
+        progress_cancel.cancel();
 
         let total_duration = start.elapsed();
 
@@ -200,6 +295,10 @@ impl YtDlpLiveRecorder {
                 total_bytes,
                 total_duration,
             });
+
+        if let Some(err) = exit_error {
+            return Err(err);
+        }
 
         Ok(super::RecordingResult {
             output_path: self.output_path.clone(),

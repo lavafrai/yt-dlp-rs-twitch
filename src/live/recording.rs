@@ -18,6 +18,7 @@ use super::hls;
 use crate::error::{Error, Result};
 use crate::events::DownloadEvent;
 use crate::events::types::RecordingMethod;
+use crate::live::{LiveProgress, ProgressCallback};
 
 /// Progress throttle interval (50 ms) to avoid flooding the event bus.
 const PROGRESS_THROTTLE_NANOS: u64 = 50_000_000;
@@ -44,6 +45,8 @@ pub struct LiveRecorder {
     max_duration: Option<Duration>,
     /// Whether to start from the beginning of the available stream buffer.
     live_from_start: bool,
+    /// Optional direct progress callback.
+    progress_callback: Option<ProgressCallback>,
     /// Cancellation token for graceful stop.
     cancellation_token: CancellationToken,
     /// Shared HTTP client.
@@ -68,6 +71,7 @@ impl LiveRecorder {
     ///   present in the initial HLS playlist window before polling for new ones.
     ///   When `false` (default), those initial segments are skipped and recording
     ///   starts from the next segment that arrives after polling begins.
+    /// * `progress_callback` - Optional callback invoked on every throttled progress update.
     /// * `cancellation_token` - Token to cancel recording.
     /// * `client` - Shared HTTP client.
     /// * `event_bus` - Event bus for broadcasting progress.
@@ -79,6 +83,7 @@ impl LiveRecorder {
         quality: impl Into<String>,
         max_duration: Option<Duration>,
         live_from_start: bool,
+        progress_callback: Option<ProgressCallback>,
         cancellation_token: CancellationToken,
         client: Arc<reqwest::Client>,
         event_bus: crate::events::EventBus,
@@ -90,6 +95,7 @@ impl LiveRecorder {
             quality: quality.into(),
             max_duration,
             live_from_start,
+            progress_callback,
             cancellation_token,
             client,
             event_bus,
@@ -240,12 +246,23 @@ impl LiveRecorder {
                     0.0
                 };
 
+                let progress = LiveProgress {
+                    bytes_written: total_bytes,
+                    elapsed,
+                    bitrate_bps,
+                    segments: segments_downloaded,
+                };
+
+                if let Some(cb) = &self.progress_callback {
+                    cb.call(progress.clone());
+                }
+
                 self.event_bus.emit_if_subscribed(DownloadEvent::LiveRecordingProgress {
                     video_id: self.video_id.clone(),
-                    elapsed,
-                    bytes_written: total_bytes,
-                    segments: segments_downloaded,
-                    bitrate_bps,
+                    elapsed: progress.elapsed,
+                    bytes_written: progress.bytes_written,
+                    segments: progress.segments,
+                    bitrate_bps: progress.bitrate_bps,
                 });
             }
 

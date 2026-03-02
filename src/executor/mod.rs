@@ -228,6 +228,9 @@ impl Executor {
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
+        // Kill the child process automatically when the StreamingProcess handle is
+        // dropped — this covers Ctrl+C, panics, and any other unexpected exit path.
+        command.kill_on_drop(true);
 
         #[cfg(target_os = "windows")]
         {
@@ -260,6 +263,28 @@ pub struct StreamingProcess {
 
 #[cfg(feature = "live-recording")]
 impl StreamingProcess {
+    /// Takes the stderr handle from the child process for real-time line-by-line reading.
+    ///
+    /// After calling this, [`wait()`](Self::wait) will skip stderr collection (it will be
+    /// empty in the returned [`ProcessOutput`]). Call this immediately after
+    /// [`Executor::execute_streaming`] to enable live progress parsing.
+    ///
+    /// # Returns
+    ///
+    /// The `ChildStderr` handle, or `None` if already taken.
+    pub fn take_stderr(&mut self) -> Option<tokio::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    /// Takes the stdout handle from the child process for real-time line-by-line reading.
+    ///
+    /// # Returns
+    ///
+    /// The `ChildStdout` handle, or `None` if already taken.
+    pub fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
     /// Sends `q` to stdin to trigger a graceful FFmpeg quit, then waits for exit.
     ///
     /// # Errors
