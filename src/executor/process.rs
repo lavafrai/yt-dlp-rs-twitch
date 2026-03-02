@@ -1,7 +1,5 @@
 //! Process execution and output handling.
 
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::time::Duration;
 

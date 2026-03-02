@@ -234,7 +234,6 @@ impl Executor {
 
         #[cfg(target_os = "windows")]
         {
-            use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
 
