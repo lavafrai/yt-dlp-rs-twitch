@@ -93,6 +93,7 @@ pub struct Video {
     /// The thumbnails of the video.
     pub thumbnails: Vec<Thumbnail>,
     /// The automatic captions of the video.
+    #[serde(default)]
     pub automatic_captions: HashMap<String, Vec<AutomaticCaption>>,
     /// The subtitles of the video (user-uploaded and automatic).
     #[serde(default)]
