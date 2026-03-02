@@ -30,6 +30,8 @@ pub struct FfmpegLiveRecorder {
     video_id: String,
     /// Optional maximum recording duration.
     max_duration: Option<Duration>,
+    /// Whether to start from the beginning of the stream buffer.
+    live_from_start: bool,
     /// Cancellation token for graceful stop.
     cancellation_token: CancellationToken,
     /// The event bus for emitting recording events.
@@ -49,6 +51,9 @@ impl FfmpegLiveRecorder {
     /// * `video_id` - The video ID (for events).
     /// * `quality` - Quality label (e.g. "1080p").
     /// * `max_duration` - Optional maximum recording duration.
+    /// * `live_from_start` - When `true`, passes `-live_start_index 0` to FFmpeg
+    ///   so recording starts from the first available HLS segment instead of
+    ///   the default near-live position.
     /// * `cancellation_token` - Token to cancel recording.
     /// * `event_bus` - Event bus for broadcasting progress.
     #[allow(clippy::too_many_arguments)]
@@ -59,6 +64,7 @@ impl FfmpegLiveRecorder {
         video_id: impl Into<String>,
         quality: impl Into<String>,
         max_duration: Option<Duration>,
+        live_from_start: bool,
         cancellation_token: CancellationToken,
         event_bus: crate::events::EventBus,
     ) -> Self {
@@ -69,6 +75,7 @@ impl FfmpegLiveRecorder {
             video_id: video_id.into(),
             quality: quality.into(),
             max_duration,
+            live_from_start,
             cancellation_token,
             event_bus,
         }
@@ -111,13 +118,21 @@ impl FfmpegLiveRecorder {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Build FFmpeg args: -i <url> -c copy [-t duration] -y <output>
-        let mut args: Vec<String> = vec![
+        // Build FFmpeg args: [-live_start_index 0] -i <url> -c copy [-t duration] -y <output>
+        let mut args: Vec<String> = Vec::new();
+
+        if self.live_from_start {
+            // Start from the first available HLS segment instead of near-live default
+            args.push("-live_start_index".to_string());
+            args.push("0".to_string());
+        }
+
+        args.extend([
             "-i".to_string(),
             self.stream_url.clone(),
             "-c".to_string(),
             "copy".to_string(),
-        ];
+        ]);
 
         if let Some(max) = self.max_duration {
             args.push("-t".to_string());

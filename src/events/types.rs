@@ -16,6 +16,8 @@ pub enum RecordingMethod {
     Native,
     /// FFmpeg-based recording (fallback)
     Fallback,
+    /// yt-dlp-based recording with `--live-from-start` support
+    YtDlp,
 }
 
 /// Represents all possible events that can occur during download operations
@@ -278,6 +280,7 @@ impl fmt::Display for RecordingMethod {
         match self {
             Self::Native => f.write_str("Native"),
             Self::Fallback => f.write_str("Fallback"),
+            Self::YtDlp => f.write_str("YtDlp"),
         }
     }
 }

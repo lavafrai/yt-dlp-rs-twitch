@@ -11,6 +11,7 @@
 pub mod ffmpeg_recording;
 pub mod hls;
 pub mod recording;
+pub mod ytdlp_recording;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ use std::time::Duration;
 pub use ffmpeg_recording::FfmpegLiveRecorder;
 pub use hls::{HlsPlaylist, HlsSegment, HlsVariant};
 pub use recording::LiveRecorder;
+pub use ytdlp_recording::YtDlpLiveRecorder;
 use tokio_util::sync::CancellationToken;
 
 use crate::Downloader;
@@ -89,6 +91,8 @@ pub struct LiveRecordingBuilder<'a> {
     max_duration: Option<Duration>,
     format: Option<&'a Format>,
     cancellation_token: Option<CancellationToken>,
+    /// Whether to start recording from the beginning of the available stream buffer.
+    live_from_start: bool,
 }
 
 impl<'a> LiveRecordingBuilder<'a> {
@@ -108,6 +112,7 @@ impl<'a> LiveRecordingBuilder<'a> {
             max_duration: None,
             format: None,
             cancellation_token: None,
+            live_from_start: false,
         }
     }
 
@@ -155,6 +160,23 @@ impl<'a> LiveRecordingBuilder<'a> {
         self
     }
 
+    /// Starts recording from the beginning of the available stream buffer (DVR / replay).
+    ///
+    /// Equivalent to yt-dlp's `--live-from-start` flag.
+    ///
+    /// When enabled, delegates recording to the yt-dlp binary itself, which
+    /// handles platform-specific DVR / replay logic (e.g. Twitch VOD replay,
+    /// YouTube DVR). The chosen `method` (Native / Fallback) is ignored in
+    /// this mode because neither HLS-based engine can reach segments outside
+    /// the current playlist window.
+    ///
+    /// Has no effect when `false` (the default): recording starts from near
+    /// the live edge using the selected engine.
+    pub fn with_live_from_start(mut self) -> Self {
+        self.live_from_start = true;
+        self
+    }
+
     /// Starts the live recording.
     ///
     /// # Errors
@@ -173,6 +195,49 @@ impl<'a> LiveRecordingBuilder<'a> {
                 &self.video.live_status,
                 "video is not currently live",
             ));
+        }
+
+        let cancellation_token = self
+            .cancellation_token
+            .unwrap_or_else(|| self.downloader.cancellation_token.child_token());
+
+        // When live_from_start is requested, delegate to yt-dlp which handles
+        // platform-specific replay/DVR logic that HLS recorders cannot.
+        if self.live_from_start {
+            let webpage_url = self
+                .video
+                .webpage_url
+                .as_deref()
+                .unwrap_or("unknown")
+                .to_string();
+
+            let quality = self
+                .format
+                .and_then(|f| f.video_resolution.height.map(|h| format!("{h}p")))
+                .unwrap_or_else(|| "best".to_string());
+
+            tracing::info!(
+                video_id = self.video.id,
+                method = "yt-dlp",
+                quality = quality,
+                output = ?self.output_path,
+                live_from_start = true,
+                "📥 Starting live recording"
+            );
+
+            let recorder = YtDlpLiveRecorder::new(
+                &webpage_url,
+                self.output_path,
+                &self.downloader.libraries.youtube,
+                &self.video.id,
+                &quality,
+                self.downloader.args.clone(),
+                self.max_duration,
+                cancellation_token,
+                self.downloader.event_bus.clone(),
+            );
+
+            return recorder.record().await;
         }
 
         // Select the format to record
@@ -194,15 +259,12 @@ impl<'a> LiveRecordingBuilder<'a> {
             .map(|h| format!("{h}p"))
             .unwrap_or_else(|| "unknown".to_string());
 
-        let cancellation_token = self
-            .cancellation_token
-            .unwrap_or_else(|| self.downloader.cancellation_token.child_token());
-
         tracing::info!(
             video_id = self.video.id,
             method = ?self.method,
             quality = quality,
             output = ?self.output_path,
+            live_from_start = self.live_from_start,
             "📥 Starting live recording"
         );
 
@@ -221,6 +283,7 @@ impl<'a> LiveRecordingBuilder<'a> {
                     &self.video.id,
                     &quality,
                     self.max_duration,
+                    self.live_from_start,
                     cancellation_token,
                     client,
                     self.downloader.event_bus.clone(),
@@ -228,7 +291,7 @@ impl<'a> LiveRecordingBuilder<'a> {
 
                 recorder.record().await
             }
-            RecordingMethod::Fallback => {
+            RecordingMethod::Fallback | RecordingMethod::YtDlp => {
                 let recorder = FfmpegLiveRecorder::new(
                     stream_url,
                     self.output_path,
@@ -236,6 +299,7 @@ impl<'a> LiveRecordingBuilder<'a> {
                     &self.video.id,
                     &quality,
                     self.max_duration,
+                    self.live_from_start,
                     cancellation_token,
                     self.downloader.event_bus.clone(),
                 );
@@ -253,6 +317,7 @@ impl fmt::Debug for LiveRecordingBuilder<'_> {
             .field("output_path", &self.output_path)
             .field("method", &self.method)
             .field("max_duration", &self.max_duration)
+            .field("live_from_start", &self.live_from_start)
             .field("has_format", &self.format.is_some())
             .field("has_token", &self.cancellation_token.is_some())
             .finish()

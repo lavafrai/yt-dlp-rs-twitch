@@ -42,6 +42,8 @@ pub struct LiveRecorder {
     video_id: String,
     /// Optional maximum recording duration.
     max_duration: Option<Duration>,
+    /// Whether to start from the beginning of the available stream buffer.
+    live_from_start: bool,
     /// Cancellation token for graceful stop.
     cancellation_token: CancellationToken,
     /// Shared HTTP client.
@@ -62,6 +64,10 @@ impl LiveRecorder {
     /// * `video_id` - The video ID (for events).
     /// * `quality` - Quality label (e.g. "1080p").
     /// * `max_duration` - Optional maximum recording duration.
+    /// * `live_from_start` - When `true`, also downloads all segments already
+    ///   present in the initial HLS playlist window before polling for new ones.
+    ///   When `false` (default), those initial segments are skipped and recording
+    ///   starts from the next segment that arrives after polling begins.
     /// * `cancellation_token` - Token to cancel recording.
     /// * `client` - Shared HTTP client.
     /// * `event_bus` - Event bus for broadcasting progress.
@@ -72,6 +78,7 @@ impl LiveRecorder {
         video_id: impl Into<String>,
         quality: impl Into<String>,
         max_duration: Option<Duration>,
+        live_from_start: bool,
         cancellation_token: CancellationToken,
         client: Arc<reqwest::Client>,
         event_bus: crate::events::EventBus,
@@ -82,6 +89,7 @@ impl LiveRecorder {
             video_id: video_id.into(),
             quality: quality.into(),
             max_duration,
+            live_from_start,
             cancellation_token,
             client,
             event_bus,
@@ -138,28 +146,30 @@ impl LiveRecorder {
         let initial = hls::parse_media(&self.client, &self.playlist_url).await?;
         let poll_interval = Duration::from_secs_f64(initial.target_duration / 2.0);
 
-        // Seed seen set with initial segments (don't re-download them)
+        // Always seed so the poll loop never re-downloads these segments
         for seg in &initial.segments {
             seen_sequences.insert(seg.sequence);
         }
 
-        // Download initial segments to start the file
-        for seg in &initial.segments {
-            if self.cancellation_token.is_cancelled() {
-                break;
+        // Download initial segments only when live_from_start is requested
+        if self.live_from_start {
+            for seg in &initial.segments {
+                if self.cancellation_token.is_cancelled() {
+                    break;
+                }
+                let data = self.fetch_segment(&seg.url).await?;
+                writer
+                    .write_all(&data)
+                    .await
+                    .map_err(|e| Error::io_with_path("writing segment", &self.output_path, e))?;
+                bytes_written.fetch_add(data.len() as u64, Ordering::Relaxed);
+                segments_downloaded += 1;
             }
-            let data = self.fetch_segment(&seg.url).await?;
             writer
-                .write_all(&data)
+                .flush()
                 .await
-                .map_err(|e| Error::io_with_path("writing segment", &self.output_path, e))?;
-            bytes_written.fetch_add(data.len() as u64, Ordering::Relaxed);
-            segments_downloaded += 1;
+                .map_err(|e| Error::io_with_path("flushing output", &self.output_path, e))?;
         }
-        writer
-            .flush()
-            .await
-            .map_err(|e| Error::io_with_path("flushing output", &self.output_path, e))?;
 
         // Poll loop
         let stop_reason = loop {
