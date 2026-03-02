@@ -107,11 +107,14 @@ pub struct Video {
     pub heatmap: Option<Heatmap>,
 
     /// The tags of the video.
+    #[serde(default)]
     pub tags: Vec<String>,
     /// The categories of the video.
+    #[serde(default)]
     pub categories: Vec<String>,
 
     /// If the video is age restricted, the age limit is different from 0.
+    #[serde(default)]
     pub age_limit: i64,
     /// If the video is available in the country.
     #[serde(rename = "_has_drm")]
@@ -119,6 +122,7 @@ pub struct Video {
     /// If the video was a live stream.
     pub live_status: String,
     /// If the video is playable in an embed.
+    #[serde(default)]
     pub playable_in_embed: bool,
 
     /// The extractor information.
